@@ -133,8 +133,8 @@ function Invoke-InitializeModule
         Title = "Use WAM for enhanced login methods"
         Key = "UseWAM"
         Type = "Boolean"
-        DefaultValue = $false
-        Description = "Use WAM for enhanced login methods"
+        DefaultValue = $true
+        Description = "Sign in through Windows (WAM). Supports passkeys, FIDO2 security keys and Windows Hello. Requires PowerShell 7: Start.cmd uses it when it is installed. Note: Requires restart"
     }) "MSAL"
 
     Add-SettingsObject (New-Object PSObject -Property @{
@@ -146,9 +146,14 @@ function Invoke-InitializeModule
     }) "MSAL"
 
     $script:MSALUseWAM = Get-SettingValue "UseWAM"
+    $script:MSALWAMNeedsPS7 = $false
+    $script:MSALWAMWarningShown = $false
+    $script:MSALWAMLoadFailed = $false
     if($script:MSALUseWAM -and $PSVersionTable.PSVersion.Major -lt 7) {
-        Write-Log "WAM is only supported in PowerShell 7 and later. Disabling WAM" 2
+        Write-Log "WAM is only supported in PowerShell 7 and later. Disabling WAM. Start the app with Start.cmd after installing PowerShell 7" 2
         $script:MSALUseWAM = $false
+        # Told to the user at the first interactive sign-in, see Show-MSALWAMWarning
+        $script:MSALWAMNeedsPS7 = $true
     }
 
     # System Browser takes precedence over WAM: passkey/FIDO2 login works in the real browser
@@ -158,6 +163,10 @@ function Invoke-InitializeModule
         Write-Log "Both UseWAM and UseSystemBrowser are enabled - the system browser takes precedence for interactive login" 2
         $script:MSALUseWAM = $false
     }
+
+    if($script:MSALUseWAM) { Write-Log "Sign-in method: WAM (Windows broker)" }
+    elseif($script:MSALUseSystemBrowser) { Write-Log "Sign-in method: system browser" }
+    else { Write-Log "Sign-in method: embedded window (no passkey or FIDO2 support)" }
 
     Add-MSALPrereq
 }
@@ -540,10 +549,10 @@ function Add-MSALPrereq
     }    
     $DLLFiles += [IO.FileInfo]($ScriptRoot + "\Bin\Microsoft.Identity.Client.dll")    
     if($script:MSALUseWAM) {
-        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\BIN\$MSALDLLPath\Microsoft.Identity.Client.Extensions.Msal.dll")
-        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\BIN\$MSALDLLPath\Microsoft.Identity.Client.Broker.dll")
-        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\BIN\$MSALDLLPath\Microsoft.Identity.Client.Desktop.dll")
-        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\BIN\$MSALDLLPath\Microsoft.Identity.Client.NativeInterop.dll")
+        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\Bin\Microsoft.Identity.Client.Extensions.Msal.dll")
+        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\Bin\Microsoft.Identity.Client.Broker.dll")
+        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\Bin\Microsoft.Identity.Client.Desktop.dll")
+        $DLLFiles += [IO.FileInfo]($ScriptRoot + "\Bin\Microsoft.Identity.Client.NativeInterop.dll")
     }
 
     $DLLFiles | ForEach-Object {
@@ -594,7 +603,7 @@ function Add-MSALPrereq
         }
     }    
 
-    if($script:MSALUseWAM) {
+    if($script:MSALUseWAM -and -not ("MSALMethods" -as [type])) {
         [System.Collections.Generic.List[string]] $RequiredAssemblies = New-Object System.Collections.Generic.List[string]
 
         foreach($file in $DLLFiles) {
@@ -604,6 +613,8 @@ function Add-MSALPrereq
         $RequiredAssemblies.Add('System.dll')
         $RequiredAssemblies.Add('System.Windows.Forms')
         # Import necessary methods from user32.dll and kernel32.dll
+        try
+        {
         Add-Type @"
             using System;
             using System.Runtime.InteropServices;
@@ -635,9 +646,19 @@ function Add-MSALPrereq
                     return handle;
                 }
 
+                // The main app window, set from PowerShell by Get-MSALParentWindow. The console is
+                // hidden, so a WAM dialog parented to it can open behind the app or fail to show.
+                public static IntPtr ParentWindow = IntPtr.Zero;
+
+                public static IntPtr GetParentWindow()
+                {
+                    if (ParentWindow != IntPtr.Zero) return ParentWindow;
+                    return GetConsoleOrTerminalWindow();
+                }
+
                 public static void AddParentActivirtyOrWindow(PublicClientApplicationBuilder appBuilder)
                 {
-                    appBuilder.WithParentActivityOrWindow(GetConsoleOrTerminalWindow);
+                    appBuilder.WithParentActivityOrWindow(GetParentWindow);
                 }
 
                 public static void AddWithBroker(PublicClientApplicationBuilder appBuilder, BrokerOptions options)
@@ -647,7 +668,81 @@ function Add-MSALPrereq
             }
 
 "@ -ReferencedAssemblies $RequiredAssemblies -IgnoreWarnings
+        }
+        catch
+        {
+            Write-LogError "Failed to compile the WAM helper. Check write access to the temp folder and ASR policies" $_.Exception
+        }
+
+        if(-not ("MSALMethods" -as [type]) -or -not ("Microsoft.Identity.Client.BrokerOptions" -as [type]))
+        {
+            # Without the helper or the broker library every sign-in would fail, so fall back
+            # to the embedded window and tell the user at the first interactive sign-in
+            Write-Log "WAM could not be loaded. Falling back to the embedded sign-in window" 3
+            $script:MSALUseWAM = $false
+            $script:MSALWAMLoadFailed = $true
+        }
     }
+}
+
+function Get-MSALParentWindow
+{
+    # WAM shows its sign-in dialog on top of this window. The main WPF window is the right owner:
+    # the console window is hidden, and the process main window can still be the splash screen.
+    $handle = [IntPtr]::Zero
+    if($global:window)
+    {
+        try { $handle = ([System.Windows.Interop.WindowInteropHelper]::new($global:window)).Handle } catch { }
+    }
+    if($handle -eq [IntPtr]::Zero)
+    {
+        $handle = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
+    }
+    if($script:MSALUseWAM -and ("MSALMethods" -as [type]))
+    {
+        [MSALMethods]::ParentWindow = $handle
+    }
+    $handle
+}
+
+function Add-MSALBroker
+{
+    # Use WAM (the Windows broker) for this app when enabled. Every MSAL app that can show a
+    # sign-in needs this, or that sign-in falls back to the embedded window without FIDO2 support.
+    param($appBuilder)
+
+    if(-not $script:MSALUseWAM) { return }
+
+    [void](Get-MSALParentWindow)
+    [MSALMethods]::AddParentActivirtyOrWindow($appBuilder)
+
+    $options = [Microsoft.Identity.Client.BrokerOptions]::new([Microsoft.Identity.Client.BrokerOptions+OperatingSystems]::Windows)
+    $options.Title = "Intune Manager"
+
+    [MSALMethods]::AddWithBroker($appBuilder, $options)
+}
+
+function Show-MSALWAMWarning
+{
+    # Passkeys and FIDO2 keys only work through WAM or the system browser. Say once why the old
+    # sign-in window is shown instead, rather than leaving the user stuck at a password prompt.
+    if($script:MSALWAMWarningShown -or $script:MSALUseWAM -or $script:MSALUseSystemBrowser) { return }
+
+    if($script:MSALWAMNeedsPS7)
+    {
+        $msg = "Sign-in with passkeys, FIDO2 security keys and Windows Hello uses WAM, and WAM needs PowerShell 7.`n`nThis session runs in Windows PowerShell $($PSVersionTable.PSVersion), so the old sign-in window is used.`n`nInstall PowerShell 7 (winget install --id Microsoft.PowerShell) and start the app with Start.cmd. Or enable 'Use System Browser for login' in Settings."
+    }
+    elseif($script:MSALWAMLoadFailed)
+    {
+        $msg = "WAM could not be loaded, so the old sign-in window is used. Passkeys and FIDO2 security keys will not work there.`n`nSee the log for details, or enable 'Use System Browser for login' in Settings."
+    }
+    else
+    {
+        return
+    }
+
+    $script:MSALWAMWarningShown = $true
+    [System.Windows.MessageBox]::Show($msg, "WAM not available", "OK", "Warning") | Out-Null
 }
 
 function Add-MSALPrereq_old
@@ -964,14 +1059,7 @@ function Get-MSALApp
         [void] $appBuilder.WithClientName("CloudAPIPowerShellManagement")
         [void] $appBuilder.WithClientVersion($PSVersionTable.PSVersion)
 
-        if($script:MSALUseWAM) {
-            [MSALMethods]::AddParentActivirtyOrWindow($appBuilder)
-
-            $options = [Microsoft.Identity.Client.BrokerOptions]::new([Microsoft.Identity.Client.BrokerOptions+OperatingSystems]::Windows)
-            $options.Title = "Intune Manager"
-            
-            [MSALMethods]::AddWithBroker($appBuilder, $options)
-        }
+        Add-MSALBroker $appBuilder
 
         Add-MSALProxy $appBuilder   
         
@@ -1276,6 +1364,8 @@ function Connect-MSALUser
         #########################################################################################################
         Write-Log "Initiate interactive logon"
 
+        Show-MSALWAMWarning
+
         if($useDefaultPermissions -eq $false) 
         {
             [string[]]$Scopes = Get-MSALRequiredScopes            
@@ -1313,8 +1403,8 @@ function Connect-MSALUser
             [void]$AquireTokenObj.WithClaims($script:authenticationFailure.Claims) 
         }
 
-        [IntPtr]$ParentWindow = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
-        if ($ParentWindow)
+        [IntPtr]$ParentWindow = Get-MSALParentWindow
+        if ($ParentWindow -ne [IntPtr]::Zero)
         {
             [void]$aquireTokenObj.WithParentActivityOrWindow($ParentWindow)
         }
@@ -1395,6 +1485,9 @@ function Connect-MSALUser
                 }
                 if($tenantRedirectUri) { [void]$appBuilder.WithRedirectUri($tenantRedirectUri) }
 
+                # Same broker as the main login, so the account and its FIDO2 sign-in are reused
+                Add-MSALBroker $appBuilder
+
                 Add-MSALProxy $appBuilder
 
                 $app = $appBuilder.Build()
@@ -1414,6 +1507,11 @@ function Connect-MSALUser
                     #[void]$AquireTokenObj.WithAccount($authResult.Account)
                     [void]$AquireTokenObj.WithLoginHint($authResult.Account.Username)
                     [void]$AquireTokenObj.WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt)
+                    [IntPtr]$ParentWindow = Get-MSALParentWindow
+                    if ($ParentWindow -ne [IntPtr]::Zero)
+                    {
+                        [void]$AquireTokenObj.WithParentActivityOrWindow($ParentWindow)
+                    }
                     if($script:MSALUseSystemBrowser)
                     {
                         try { [void]$AquireTokenObj.WithUseEmbeddedWebView($false) }
@@ -1506,8 +1604,8 @@ function Start-MSALConsentPrompt
     [void]$aquireTokenObj.WithAuthority("https://$((Get-MSALAppAuthority))/$tenantId/")
     [void]$AquireTokenObj.WithLoginHint($loginHintName) 
     
-    [IntPtr]$ParentWindow = [System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle
-    if ($ParentWindow)
+    [IntPtr]$ParentWindow = Get-MSALParentWindow
+    if ($ParentWindow -ne [IntPtr]::Zero)
     {
         [void]$aquireTokenObj.WithParentActivityOrWindow($ParentWindow) 
     }

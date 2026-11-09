@@ -1,5 +1,12 @@
 # IntuneManagement with PowerShell and WPF UI
 
+> **Nicebyte fork: sign in with WAM, passkeys and FIDO2 security keys.**
+> This fork of [Micke-K/IntuneManagement](https://github.com/Micke-K/IntuneManagement) (3.11.0)
+> signs in through WAM, the Windows sign-in broker, by default. WAM supports FIDO2 security keys,
+> passkeys and Windows Hello, which the old embedded sign-in window does not.
+> See [Sign in with WAM (Nicebyte fork)](#sign-in-with-wam-nicebyte-fork) below.
+
+
 > **Version 4.0 is in beta.** A full rewrite that also runs on macOS and Linux,
 > with every operation available as a PowerShell command for automation.
 > Try it from the [`v4` branch](../../tree/v4) or the [4.0.0-beta1 pre-release](../../releases/tag/4.0.0-beta1).
@@ -27,6 +34,47 @@ This PowerShell application is based on the foundation modules CloudAPIPowerShel
 **Security note:** Since the scripts are not signed, a warning might be display when running it and files might be blocked. The script will unblock all files. This is to avoid issues that it fails to load the MSAL library etc. If there are any security concerns, the PowerShell code can be reviewed and the DLL files can be downloaded manually from Microsoft repositories, see links below. The DLL files *CAN* be removed but MSAL is a pre-requisite for authentication. The script will try to find the DLL in the Az or MSAL.PS module if not found in the script root directory. DLL files are included to reduce dependencies.
 
 **Development release:** Changes will be uploaded to the [Development](https://github.com/Micke-K/IntuneManagement/tree/Development) branch. Changes and fixes will be implement to this branch. Any PRs must be merging thatto this branch. 
+
+## Sign in with WAM (Nicebyte fork)
+
+What this fork changes compared to upstream 3.11.0:
+
+* **WAM is on by default.** Settings > MSAL > *Use WAM for enhanced login methods*. If you saved
+  your settings before with WAM off, turn it on there and restart the app.
+* **Start.cmd starts PowerShell 7 when it is installed.** WAM only works in PowerShell 7; upstream
+  silently fell back to the embedded window in Windows PowerShell 5.1. If PowerShell 7 is missing,
+  the app still starts in 5.1 and tells you at the first sign-in why passkeys will not work.
+  `Start _PS7.cmd` is renamed to `Start-PS7.cmd`.
+* **The WAM dialog is parented to the app window** instead of the hidden console window, so it
+  opens in front of the app.
+* **Every sign-in uses WAM:** the main sign-in, the consent prompt and the tenant list
+  (*Get Tenant List*), which upstream still sent to the embedded window.
+* If WAM cannot be loaded (for example blocked by an ASR rule), the app falls back to the
+  embedded window instead of failing every sign-in, and says so.
+
+### Requirements
+
+* Windows 10 1903 or later, or Windows 11.
+* PowerShell 7: `winget install --id Microsoft.PowerShell --source winget`
+* The default app (Microsoft Graph PowerShell) works as is. A custom app registration needs the
+  WAM redirect URI under **Mobile and desktop applications**:
+  `ms-appx-web://microsoft.aad.brokerplugin/<client id>`
+
+### Signing in
+
+1. Start the app with **Start.cmd** under your own Windows account.
+2. Click the login button. The Windows sign-in dialog opens.
+3. Choose **Work or school account** (or *Use another account*), enter the admin account and
+   sign in with the security key or passkey.
+4. When Windows asks **Stay signed in to all your apps**, choose
+   **No, sign in to this app only**. Otherwise Windows registers this device in that tenant,
+   which you do not want for a customer tenant.
+
+The log file (`CloudAPIPowerShellManagement.log` in the app folder) shows the sign-in method at
+startup: `Sign-in method: WAM (Windows broker)`.
+
+If WAM still does not work, *Use System Browser for login* in Settings is the alternative: it
+signs in through Edge or Chrome, which also supports passkeys and FIDO2 keys.
 
 ## Starting the App
 
